@@ -1,0 +1,12 @@
+{
+	"$schema": "./node_modules/wrangler/config-schema.json",
+	"name": "kixel-us",
+	"compatibility_date": "2025-07-09",
+	"assets": {
+		"directory": "./public"
+	},
+	"routes": [{ "pattern": "kixel.us", "custom_domain": true }],
+	"observability": {
+		"enabled": true
+	}
+}
