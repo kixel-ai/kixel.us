@@ -1,0 +1,74 @@
+# One-off end-to-end check of nix.kixel.quest's OIDC push exchange (kixel-ai/kixel.quest's quest/m0/nix-cache.md).
+# Removed once its runs are recorded.
+name: nix-cache-proof
+
+on:
+  workflow_dispatch:
+    inputs:
+      step:
+        description: push a new path, or refresh the pushed one
+        type: choice
+        options: [push, refresh]
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  proof:
+    runs-on: ubuntu-latest
+    env:
+      CACHE: public-ci
+      OTHER: private
+      STEP: ${{ github.event_name == 'pull_request' && 'refused' || inputs.step }}
+    defaults:
+      run:
+        shell: nix shell nixpkgs#jq nixpkgs#curl --command bash -euo pipefail {0}
+    steps:
+      - uses: cachix/install-nix-action@382a9ed9481c7c1f94f68b72ef105b3417c73877 # v32.1.0
+      - run: |
+          api=https://nix.kixel.quest
+          token=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=kixel.quest" | jq -r .value)
+          jq -R 'split(".")[1] | gsub("-";"+") | gsub("_";"/") | @base64d | fromjson | {repository, repository_visibility, ref, ref_protected, event_name}' <<<"$token" || true
+          # POSTs $2 to endpoint $1, printing the status and the body (except presigned URLs), and fails unless it is $3.
+          expect() {
+            status=$(curl -sS -o body.json -w '%{http_code}' -X POST -H "Authorization: Bearer $token" -H 'Content-Type: application/json' --data-binary "$2" "$api$1")
+            echo "POST $1 $2 -> $status $(jq -c 'if .uploads then .uploads |= map_values({headers}) else . end' body.json)"
+            [ "$status" = "$3" ] || { echo "expected $3"; exit 1; }
+          }
+
+          printf 'nix.kixel.quest end-to-end proof, %s\n' "$CACHE" > proof.txt
+          path=$(nix store add-file --name "nix-cache-proof-$CACHE" ./proof.txt)
+          hash=$(basename "$path" | cut -c1-32)
+          echo "path: $path"
+
+          case "$STEP" in
+          refused)
+            expect /push/upload "{\"cache\":\"$CACHE\",\"nars\":[]}" 403
+            ;;
+          push)
+            rm -rf out
+            nix copy --to "file://$PWD/out?compression=xz" "$path"
+            nar=$(sed -n 's/^URL: //p' "out/$hash.narinfo")
+            info=$(jq -Rs '.' "out/$hash.narinfo")
+            # The other side's bucket is refused, and a narinfo before its NAR names the NAR to upload.
+            expect /push/upload "{\"cache\":\"$OTHER\",\"nars\":[\"$nar\"]}" 403
+            expect /push/narinfo "{\"cache\":\"$CACHE\",\"narinfos\":[$info]}" 409
+            expect /push/upload "{\"cache\":\"$CACHE\",\"nars\":[\"$nar\"]}" 200
+            url=$(jq -r --arg n "$nar" '.uploads[$n].url' body.json)
+            sum=$(jq -r --arg n "$nar" '.uploads[$n].headers["x-amz-checksum-sha256"]' body.json)
+            # Other bytes than the key names are refused by B2.
+            bad=$(curl -sS -o /dev/null -w '%{http_code}' -X PUT -H 'Content-Encoding: identity' -H "x-amz-checksum-sha256: $sum" --data-binary 'not the nar' "$url")
+            echo "PUT other bytes -> $bad"; [ "$bad" = 400 ]
+            curl -sSf -o /dev/null -X PUT -H 'Content-Encoding: identity' -H "x-amz-checksum-sha256: $sum" --data-binary "@out/$nar" "$url"
+            echo "PUT $nar -> 200"
+            expect /push/narinfo "{\"cache\":\"$CACHE\",\"narinfos\":[$info]}" 200
+            ;;
+          refresh)
+            if [ "$CACHE" = private ]; then
+              expect /push/refresh "{\"hashes\":[\"$hash\"]}" 403
+            else
+              expect /push/refresh "{\"hashes\":[\"$hash\"]}" 200
+              [ "$(jq -r --arg h "$hash" '.hashes[$h]' body.json)" = refreshed ]
+            fi
+            ;;
+          esac
