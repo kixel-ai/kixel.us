@@ -1,0 +1,53 @@
+# One-off: re-signs the nix-moq-dev releases copied into nix.kixel.quest's nix-public-release with nix.kixel.quest-2,
+# keeping their nix.moq.dev-1 signatures (kixel-ai/kixel.quest's quest/m0/nix-cache.md, step 1). For each narinfo
+# .github/nix-resign.txt names, it PUTs the NAR's same bytes through /push/upload's presigned URL, which gives B2 the
+# checksum /push/narinfo requires, then posts the narinfo to /push/narinfo to be signed. Removed once its run is recorded.
+name: nix-resign
+
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  resign:
+    runs-on: ubuntu-latest
+    env:
+      API: https://nix.kixel.quest
+    defaults:
+      run:
+        shell: bash -euo pipefail {0}
+    steps:
+      - run: |
+          # A fresh OIDC token per request, since a batch can outlast one.
+          token() { curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=kixel.quest" | jq -r .value; }
+          # POSTs the JSON file $2 to endpoint $1, leaving the answer in out.json, and fails unless it is a 200.
+          post() {
+            status=$(curl -sS -o out.json -w '%{http_code}' -X POST -H "Authorization: Bearer $(token)" -H 'Content-Type: application/json' --data-binary "@$2" "$API$1")
+            [ "$status" = 200 ] || { echo "POST $1 -> $status $(cat out.json)"; exit 1; }
+          }
+
+          curl -sSf -o hashes.txt "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/.github/nix-resign.txt"
+          [ "$(wc -l < hashes.txt)" = 821 ]
+          split -l 100 hashes.txt batch.
+          for batch in batch.*; do
+            rm -rf info nar && mkdir info nar
+            while read -r hash; do curl -sSf -o "info/$hash.narinfo" "$API/$hash.narinfo"; done < "$batch"
+            sed -n 's/^URL: //p' info/*.narinfo | sort -u > nars.txt
+            jq -Rn '{cache: "public-release", nars: [inputs]}' nars.txt > req.json
+            post /push/upload req.json
+            mv out.json uploads.json
+            # shellcheck disable=SC2016
+            xargs -P 6 -n 1 bash -euo pipefail -c '
+              file=$(mktemp -p nar)
+              curl -sSf -o "$file" "$API/$1"
+              url=$(jq -r --arg n "$1" ".uploads[\$n].url" uploads.json)
+              sum=$(jq -r --arg n "$1" ".uploads[\$n].headers[\"x-amz-checksum-sha256\"]" uploads.json)
+              curl -sSf -o /dev/null -T "$file" -H "Content-Encoding: identity" -H "x-amz-checksum-sha256: $sum" "$url"
+              rm "$file"' _ < nars.txt
+            for info in info/*.narinfo; do jq -Rs . "$info"; done | jq -s '{cache: "public-release", narinfos: .}' > req.json
+            post /push/narinfo req.json
+            echo "$batch: $(wc -l < nars.txt) NARs re-uploaded, $(jq '.written | length' out.json) narinfos signed"
+            [ "$(jq '.written | length' out.json)" = "$(wc -l < "$batch")" ]
+          done
