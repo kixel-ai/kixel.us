@@ -34,6 +34,10 @@ jobs:
           for batch in batch.*; do
             rm -rf info nar && mkdir info nar
             while read -r hash; do curl -sSf -o "info/$hash.narinfo" "$API/$hash.narinfo"; done < "$batch"
+            # A rerun resumes: a narinfo this run's predecessor already signed is left as it is.
+            { grep -l '^Sig: nix.kixel.quest-2:' info/*.narinfo || true; } | xargs -r rm
+            todo=$(find info -name '*.narinfo' | wc -l)
+            [ "$todo" -gt 0 ] || { echo "$batch: already signed"; continue; }
             sed -n 's/^URL: //p' info/*.narinfo | sort -u > nars.txt
             jq -Rn '{cache: "public-release", nars: [inputs]}' nars.txt > req.json
             post /push/upload req.json
@@ -41,13 +45,15 @@ jobs:
             # shellcheck disable=SC2016
             xargs -P 6 -n 1 bash -euo pipefail -c '
               file=$(mktemp -p nar)
-              curl -sSf -o "$file" "$API/$1"
+              status=$(curl -sS -o "$file" -w "%{http_code}" "$API/$1")
+              [ "$status" = 200 ] || { echo "GET $1 -> $status $(head -c 500 "$file")"; exit 1; }
               url=$(jq -r --arg n "$1" ".uploads[\$n].url" uploads.json)
               sum=$(jq -r --arg n "$1" ".uploads[\$n].headers[\"x-amz-checksum-sha256\"]" uploads.json)
-              curl -sSf -o /dev/null -T "$file" -H "Content-Encoding: identity" -H "x-amz-checksum-sha256: $sum" "$url"
-              rm "$file"' _ < nars.txt
+              status=$(curl -sS -o "$file.out" -w "%{http_code}" -T "$file" -H "Content-Encoding: identity" -H "x-amz-checksum-sha256: $sum" "$url")
+              [ "$status" = 200 ] || { echo "PUT $1 -> $status $(head -c 500 "$file.out")"; exit 1; }
+              rm "$file" "$file.out"' _ < nars.txt
             for info in info/*.narinfo; do jq -Rs . "$info"; done | jq -s '{cache: "public-release", narinfos: .}' > req.json
             post /push/narinfo req.json
             echo "$batch: $(wc -l < nars.txt) NARs re-uploaded, $(jq '.written | length' out.json) narinfos signed"
-            [ "$(jq '.written | length' out.json)" = "$(wc -l < "$batch")" ]
+            [ "$(jq '.written | length' out.json)" = "$todo" ]
           done
